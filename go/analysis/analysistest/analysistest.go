@@ -70,6 +70,57 @@ type Testing interface {
 	Errorf(format string, args ...interface{})
 }
 
+// Options describe Run configuration
+// RunWithOptions uses it to customize run
+type Options struct {
+	// If GOPATHMode is true, load packages from a GOPATH-style project
+	// directory. Otherwise, load them from the main module found in
+	// the directory.
+	GOPATHMode bool
+
+	// Dir sources directory.
+	Dir string
+
+	//  Patterns "go list" patterns.
+	Patterns []string
+
+	// SuggestedFixes verifies suggested fixes.
+	//
+	// It uses golden files placed alongside the source code under analysis:
+	// suggested fixes for code in example.go will be compared against example.go.golden.
+	//
+	// Golden files can be formatted in one of two ways: as plain Go source code, or as txtar archives.
+	// In the first case, all suggested fixes will be applied to the original source, which will then be compared against the golden file.
+	// In the second case, suggested fixes will be grouped by their messages, and each set of fixes will be applied and tested separately.
+	// Each section in the archive corresponds to a single message.
+	//
+	// A golden file using txtar may look like this:
+	//
+	//	-- turn into single negation --
+	//	package pkg
+	//
+	//	func fn(b1, b2 bool) {
+	//		if !b1 { // want `negating a boolean twice`
+	//			println()
+	//		}
+	//	}
+	//
+	//	-- remove double negation --
+	//	package pkg
+	//
+	//	func fn(b1, b2 bool) {
+	//		if b1 { // want `negating a boolean twice`
+	//			println()
+	//		}
+	//	}
+	SuggestedFixes bool
+}
+
+// RunWithSuggestedFixes is like RunWithOptions using Options{GOPATHMode: true, SuggestedFixes: true}.
+//
+// Deprecated: use RunWithOptions instead, so that either the test runs
+// in module mode or the need for GOPATH mode becomes more explicit.
+//
 // RunWithSuggestedFixes behaves like Run, but additionally verifies suggested fixes.
 // It uses golden files placed alongside the source code under analysis:
 // suggested fixes for code in example.go will be compared against example.go.golden.
@@ -101,6 +152,10 @@ type Testing interface {
 func RunWithSuggestedFixes(t Testing, dir string, a *analysis.Analyzer, patterns ...string) []*Result {
 	r := Run(t, dir, a, patterns...)
 
+	return processSuggestedFixes(t, r)
+}
+
+func processSuggestedFixes(t Testing, r []*Result) []*Result {
 	// Process each result (package) separately, matching up the suggested
 	// fixes into a diff, which we will compare to the .golden file.  We have
 	// to do this per-result in case a file appears in two packages, such as in
@@ -240,7 +295,10 @@ func RunWithSuggestedFixes(t Testing, dir string, a *analysis.Analyzer, patterns
 	return r
 }
 
-// Run applies an analysis to the packages denoted by the "go list" patterns.
+// Run is like RunWithOptions using Options{GOPATHMode: true}.
+//
+// Deprecated: use RunWithOptions instead, so that either the test runs
+// in module mode or the need for GOPATH mode becomes more explicit.
 //
 // It loads the packages from the specified GOPATH-style project
 // directory using golang.org/x/tools/go/packages, runs the analysis on
@@ -279,13 +337,60 @@ func RunWithSuggestedFixes(t Testing, dir string, a *analysis.Analyzer, patterns
 // attempted, even if unsuccessful. It is safe for a test to ignore all
 // the results, but a test may use it to perform additional checks.
 func Run(t Testing, dir string, a *analysis.Analyzer, patterns ...string) []*Result {
+	opts := Options{
+		GOPATHMode:     true,
+		Dir:            dir,
+		Patterns:       patterns,
+		SuggestedFixes: false,
+	}
+
+	return RunWithOptions(t, a, opts)
+}
+
+// RunWithOptions applies an analysis to the packages denoted by the "go list" patterns.
+//
+// It loads the packages using golang.org/x/tools/go/packages,
+// runs the analysis on them, and checks
+// that each analysis emits the expected diagnostics and facts
+// specified by the contents of '// want ...' comments in the
+// package's source files.
+// An expectation of a Diagnostic is specified by a string literal
+// containing a regular expression that must match the diagnostic
+// message. For example:
+//
+//	fmt.Printf("%s", 1) // want `cannot provide int 1 to %s`
+//
+// An expectation of a Fact associated with an object is specified by
+// 'name:"pattern"', where name is the name of the object, which must be
+// declared on the same line as the comment, and pattern is a regular
+// expression that must match the string representation of the fact,
+// fmt.Sprint(fact). For example:
+//
+//	func panicf(format string, args interface{}) { // want panicf:"printfWrapper"
+//
+// Package facts are specified by the name "package" and appear on
+// line 1 of the first source file of the package.
+//
+// A single 'want' comment may contain a mixture of diagnostic and fact
+// expectations, including multiple facts about the same object:
+//
+//	// want "diag" "diag2" x:"fact1" x:"fact2" y:"fact3"
+//
+// Unexpected diagnostics and facts, and unmatched expectations, are
+// reported as errors to the Testing.
+//
+// RunWithOptions reports an error to the Testing if loading or analysis failed.
+// RunWithOptions also returns a Result for each package for which analysis was
+// attempted, even if unsuccessful. It is safe for a test to ignore all
+// the results, but a test may use it to perform additional checks.
+func RunWithOptions(t Testing, a *analysis.Analyzer, options Options) []*Result {
 	if t, ok := t.(testing.TB); ok {
 		testenv.NeedsGoPackages(t)
 	}
 
-	pkgs, err := loadPackages(a, dir, patterns...)
+	pkgs, err := loadPackages(a, options)
 	if err != nil {
-		t.Errorf("loading %s: %v", patterns, err)
+		t.Errorf("loading %s: %v", options.Patterns, err)
 		return nil
 	}
 
@@ -299,9 +404,14 @@ func Run(t Testing, dir string, a *analysis.Analyzer, patterns ...string) []*Res
 		if result.Err != nil {
 			t.Errorf("error analyzing %s: %v", result.Pass, result.Err)
 		} else {
-			check(t, dir, result.Pass, result.Diagnostics, result.Facts)
+			check(t, options.Dir, result.Pass, result.Diagnostics, result.Facts)
 		}
 	}
+
+	if options.SuggestedFixes {
+		return processSuggestedFixes(t, results)
+	}
+
 	return results
 }
 
@@ -309,10 +419,10 @@ func Run(t Testing, dir string, a *analysis.Analyzer, patterns ...string) []*Res
 type Result = checker.TestAnalyzerResult
 
 // loadPackages uses go/packages to load a specified packages (from source, with
-// dependencies) from dir, which is the root of a GOPATH-style project
-// tree. It returns an error if any package had an error, or the pattern
+// dependencies) from dir.
+// It returns an error if any package had an error, or the pattern
 // matched no packages.
-func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*packages.Package, error) {
+func loadPackages(a *analysis.Analyzer, options Options) ([]*packages.Package, error) {
 	// packages.Load loads the real standard library, not a minimal
 	// fake version, which would be more efficient, especially if we
 	// have many small tests that import, say, net/http.
@@ -323,13 +433,19 @@ func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*pack
 	mode := packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports |
 		packages.NeedTypes | packages.NeedTypesSizes | packages.NeedSyntax | packages.NeedTypesInfo |
 		packages.NeedDeps
+
+	env := os.Environ()
+	if options.GOPATHMode {
+		env = append(env, "GOPATH="+options.Dir, "GO111MODULE=off", "GOPROXY=off")
+	}
+
 	cfg := &packages.Config{
 		Mode:  mode,
-		Dir:   dir,
+		Dir:   options.Dir,
 		Tests: true,
-		Env:   append(os.Environ(), "GOPATH="+dir, "GO111MODULE=off", "GOPROXY=off"),
+		Env:   env,
 	}
-	pkgs, err := packages.Load(cfg, patterns...)
+	pkgs, err := packages.Load(cfg, options.Patterns...)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +459,7 @@ func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*pack
 	}
 
 	if len(pkgs) == 0 {
-		return nil, fmt.Errorf("no packages matched %s", patterns)
+		return nil, fmt.Errorf("no packages matched %s", options.Patterns)
 	}
 	return pkgs, nil
 }
