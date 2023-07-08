@@ -323,12 +323,30 @@ func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*pack
 	mode := packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports |
 		packages.NeedTypes | packages.NeedTypesSizes | packages.NeedSyntax | packages.NeedTypesInfo |
 		packages.NeedDeps
+
+	fileExists := func(filename string) bool {
+		stat, err := os.Stat(filename)
+		return err == nil && !stat.IsDir()
+	}
+	env := append(os.Environ(), "GOPROXY=off")
+	if goWork := filepath.Join(dir, "go.work"); fileExists(goWork) {
+		// multi-module mode
+		env = append(env, "GOWORK="+goWork, "GO111MODULE=on", "GOPATH=")
+	} else if fileExists(filepath.Join(dir, "go.mod")) {
+		// module-aware mode
+		env = append(env, "GOWORK=off", "GO111MODULE=on", "GOPATH=")
+	} else {
+		// legacy GOPATH mode
+		env = append(env, "GOWORK=off", "GO111MODULE=off", "GOPATH="+dir)
+	}
+
 	cfg := &packages.Config{
 		Mode:  mode,
 		Dir:   dir,
 		Tests: true,
-		Env:   append(os.Environ(), "GOPATH="+dir, "GO111MODULE=off", "GOPROXY=off"),
+		Env:   env,
 	}
+
 	pkgs, err := packages.Load(cfg, patterns...)
 	if err != nil {
 		return nil, err
