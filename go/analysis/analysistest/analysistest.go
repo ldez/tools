@@ -328,7 +328,7 @@ func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*pack
 		stat, err := os.Stat(filename)
 		return err == nil && !stat.IsDir()
 	}
-	env := append(os.Environ(), "GOPROXY=off")
+	env := os.Environ()
 	if goWork := filepath.Join(dir, "go.work"); fileExists(goWork) {
 		// multi-module mode
 		env = append(env, "GOWORK="+goWork, "GO111MODULE=on", "GOPATH=")
@@ -337,7 +337,7 @@ func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*pack
 		env = append(env, "GOWORK=off", "GO111MODULE=on", "GOPATH=")
 	} else {
 		// legacy GOPATH mode
-		env = append(env, "GOWORK=off", "GO111MODULE=off", "GOPATH="+dir)
+		env = append(env, "GOWORK=off", "GO111MODULE=off", "GOPROXY=off", "GOPATH="+dir)
 	}
 
 	cfg := &packages.Config{
