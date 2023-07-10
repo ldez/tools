@@ -283,10 +283,18 @@ func Run(t Testing, dir string, a *analysis.Analyzer, patterns ...string) []*Res
 		testenv.NeedsGoPackages(t)
 	}
 
-	pkgs, err := loadPackages(a, dir, patterns...)
+	pkgs, err := loadPackages(dir, patterns...)
 	if err != nil {
 		t.Errorf("loading %s: %v", patterns, err)
 		return nil
+	}
+
+	// Do NOT print errors if the analyzer will continue running.
+	// It is incredibly confusing for tests to be printing to stderr
+	// willy-nilly instead of their test logs, especially when the
+	// errors are expected and are going to be fixed.
+	if !a.RunDespiteErrors {
+		packages.PrintErrors(pkgs)
 	}
 
 	if err := analysis.Validate([]*analysis.Analyzer{a}); err != nil {
@@ -312,7 +320,7 @@ type Result = checker.TestAnalyzerResult
 // dependencies) from dir, which is the root of a GOPATH-style project
 // tree. It returns an error if any package had an error, or the pattern
 // matched no packages.
-func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*packages.Package, error) {
+func loadPackages(dir string, patterns ...string) ([]*packages.Package, error) {
 	// packages.Load loads the real standard library, not a minimal
 	// fake version, which would be more efficient, especially if we
 	// have many small tests that import, say, net/http.
@@ -320,31 +328,11 @@ func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*pack
 	// a list of packages we generate and then do the parsing and
 	// typechecking, though this feature seems to be a recurring need.
 
-	mode := packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports |
-		packages.NeedTypes | packages.NeedTypesSizes | packages.NeedSyntax | packages.NeedTypesInfo |
-		packages.NeedDeps
-
-	fileExists := func(filename string) bool {
-		stat, err := os.Stat(filename)
-		return err == nil && !stat.IsDir()
-	}
-	env := os.Environ()
-	if goWork := filepath.Join(dir, "go.work"); fileExists(goWork) {
-		// multi-module mode
-		env = append(env, "GOWORK="+goWork, "GO111MODULE=on", "GOPATH=")
-	} else if fileExists(filepath.Join(dir, "go.mod")) {
-		// module-aware mode
-		env = append(env, "GOWORK=off", "GO111MODULE=on", "GOPATH=")
-	} else {
-		// legacy GOPATH mode
-		env = append(env, "GOWORK=off", "GO111MODULE=off", "GOPROXY=off", "GOPATH="+dir)
-	}
-
 	cfg := &packages.Config{
-		Mode:  mode,
-		Dir:   dir,
+		Mode:  packages.LoadAllSyntax,
 		Tests: true,
-		Env:   env,
+		Dir:   dir,
+		Env:   envForTestdata(dir),
 	}
 
 	pkgs, err := packages.Load(cfg, patterns...)
@@ -352,18 +340,50 @@ func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*pack
 		return nil, err
 	}
 
-	// Do NOT print errors if the analyzer will continue running.
-	// It is incredibly confusing for tests to be printing to stderr
-	// willy-nilly instead of their test logs, especially when the
-	// errors are expected and are going to be fixed.
-	if !a.RunDespiteErrors {
-		packages.PrintErrors(pkgs)
-	}
-
 	if len(pkgs) == 0 {
 		return nil, fmt.Errorf("no packages matched %s", patterns)
 	}
 	return pkgs, nil
+}
+
+// envForTestdata returns the GO{WORK,111MODULE,PATH,PROXY}
+// environment appropriate for loading packages from the testdata tree
+// rooted at dir. (Using the default environment risks using the
+// enclosing project's go.mod or go.work file.)
+//
+// TODO(adonovan): should we add something like this to the
+// go/packages API, as it seems like a general need when writing tests
+// that use packages.Load? (packagestest provides Export, but it is
+// much more complicated.)
+func envForTestdata(dir string) []string {
+	fileExists := func(filename string) bool {
+		stat, err := os.Stat(filename)
+		return err == nil && !stat.IsDir()
+	}
+
+	var (
+		GOWORK      = "off"
+		GO111MODULE = "on"
+		GOPROXY     = "https://proxy.golang.org" // no direct
+		GOPATH      = ""
+	)
+
+	if goWork := filepath.Join(dir, "go.work"); fileExists(goWork) {
+		// multi-module mode
+		GOWORK = goWork
+	} else if fileExists(filepath.Join(dir, "go.mod")) {
+		// module-aware mode
+	} else {
+		// legacy GOPATH mode
+		GO111MODULE = "off"
+		GOPROXY = "off"
+		GOPATH = dir
+	}
+	return append(os.Environ(),
+		"GOWORK="+GOWORK,
+		"GO111MODULE="+GO111MODULE,
+		"GOPROXY="+GOPROXY,
+		"GOPATH="+GOPATH)
 }
 
 // check inspects an analysis pass on which the analysis has already
